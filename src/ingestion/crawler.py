@@ -89,12 +89,13 @@ def crawl_repository(
                 continue
 
             # Read text contents
+            raw_bytes = file_path.read_bytes()
             try:
-                content = file_path.read_text(encoding="utf-8")
+                content = raw_bytes.decode("utf-8")
             except UnicodeDecodeError:
                 try:
                     # Fallback to UTF-8 with replacement for slight encoding anomalies
-                    content = file_path.read_text(encoding="utf-8", errors="replace")
+                    content = raw_bytes.decode("utf-8", errors="replace")
                 except OSError as e:
                     skipped_files.append(
                         SkippedFile(
