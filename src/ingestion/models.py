@@ -10,9 +10,11 @@ class SkipReason(str, Enum):
     FILE_TOO_LARGE = "file_too_large"
     ENCODING_ERROR = "encoding_error"
     PERMISSION_DENIED = "permission_denied"
+    SYMLINK_ESCAPE = "symlink_escape"
 
 
 class SkippedFile(BaseModel):
+    model_config = {"frozen": True}
     relative_path: Path = Field(
         ...,
         description="Path relative to the root directory."
@@ -28,6 +30,7 @@ class SkippedFile(BaseModel):
 
 
 class FileDocument(BaseModel):
+    model_config = {"frozen": True}
     relative_path: Path = Field(
         ...,
         description="File path relative to the repository root."
