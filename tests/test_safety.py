@@ -78,5 +78,5 @@ def test_symlink_traversal_prevention(tmp_path: Path):
 
     is_safe_escape, reason_escape, detail_escape, _ = checker.evaluate_file(escaping_link)
     assert is_safe_escape is False
-    assert reason_escape == SkipReason.IGNORED_BY_RULE
+    assert reason_escape == SkipReason.SYMLINK_ESCAPE
     assert "Symlink escapes repository root" in detail_escape

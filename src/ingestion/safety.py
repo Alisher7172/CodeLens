@@ -80,7 +80,7 @@ class FileSafetyChecker:
         """
         # 1. Symlink traversal check
         if file_path.is_symlink() and not self.is_symlink_safe(file_path):
-            return False, SkipReason.IGNORED_BY_RULE, "Symlink escapes repository root", 0
+            return False, SkipReason.SYMLINK_ESCAPE, "Symlink escapes repository root", 0
 
         # 2. File size check
         too_large, size = self.is_file_too_large(file_path)
