@@ -1,21 +1,22 @@
 # src/codelens/parsing/parser.py
-from typing import Callable
+import threading
 import tree_sitter
 import tree_sitter_python
 
 
 class LanguageRegistry:
     """
-    Resolves file extensions to corresponding Tree-sitter Language instances and Parsers.
-    Extensible for .ts, .js, .go, etc.
+    Resolves file extensions to Tree-sitter Language instances and maintains
+    thread-local reusable Parser instances to avoid per-file allocation overhead.
     """
 
     def __init__(self) -> None:
         self._languages: dict[str, tree_sitter.Language] = {}
+        # Thread-local storage to safely reuse parsers in concurrent crawls
+        self._thread_local = threading.local()
         self._register_defaults()
 
     def _register_defaults(self) -> None:
-        # Register Python parser using modern tree-sitter language bindings
         py_language = tree_sitter.Language(tree_sitter_python.language())
         self.register_extension(".py", py_language)
 
@@ -28,10 +29,24 @@ class LanguageRegistry:
         return self._languages.get(ext)
 
     def get_parser_for_file(self, extension: str) -> tree_sitter.Parser | None:
+        """
+        Returns a cached, reusable Parser for the given file extension.
+        Reuses one Parser per language per thread.
+        """
         lang = self.get_language(extension)
         if lang is None:
             return None
-        return tree_sitter.Parser(lang)
+
+        # Initialize thread-local dictionary if not already present on this thread
+        if not hasattr(self._thread_local, "parsers"):
+            self._thread_local.parsers = {}
+
+        # Cache key based on the language instance or its extension
+        ext = extension.lower() if extension.startswith(".") else f".{extension.lower()}"
+        if ext not in self._thread_local.parsers:
+            self._thread_local.parsers[ext] = tree_sitter.Parser(lang)
+
+        return self._thread_local.parsers[ext]
 
 
 # Global default registry instance
