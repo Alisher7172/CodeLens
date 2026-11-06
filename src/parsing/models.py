@@ -1,7 +1,7 @@
 # src/codelens/parsing/models.py
 from enum import Enum
 from pathlib import Path
-from pydantic import BaseModel, ConfigDict, Field, computed_field
+from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
 
 class ChunkType(str, Enum):
@@ -48,6 +48,14 @@ class CodeChunk(BaseModel):
         ...,
         description="Exact source code slice."
     )
+
+    @model_validator(mode="after")
+    def validate_line_span(self) -> "CodeChunk":
+        if self.end_line < self.start_line:
+            raise ValueError(
+                f"end_line ({self.end_line}) cannot be less than start_line ({self.start_line})"
+            )
+        return self
 
     @computed_field
     @property
