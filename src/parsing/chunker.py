@@ -1,4 +1,3 @@
-# src/codelens/parsing/chunker.py
 import logging
 from pathlib import Path
 import tree_sitter
@@ -12,9 +11,25 @@ DEFAULT_MAX_LINES = 150
 DEFAULT_MAX_CHARS = 8000
 
 
+def get_node_span(node: tree_sitter.Node) -> tuple[int, int]:
+    """
+    Returns 1-indexed (start_line, end_line) accounting for Tree-sitter's
+    (row, column=0) boundary behavior where column=0 indicates termination
+    at the start of the subsequent line.
+    """
+    start_line = node.start_point.row + 1
+    end_row = node.end_point.row
+    if node.end_point.column == 0 and end_row > node.start_point.row:
+        end_row -= 1
+    end_line = end_row + 1
+    return start_line, end_line
+
+
 class ASTChunker:
     """
-    Traverses Tree-sitter AST nodes and extracts semantic CodeChunk instances.
+    Traverses Tree-sitter AST nodes and extracts semantic CodeChunk instances,
+    preventing class-method duplication by generating class skeletons and correctly
+    unpacking decorated definitions.
     """
 
     def __init__(
@@ -32,9 +47,6 @@ class ASTChunker:
         file_path: Path,
         source_code: str,
     ) -> list[CodeChunk]:
-        """
-        Parses source_code and returns a flat list of semantic CodeChunks.
-        """
         extension = file_path.suffix
         parser = self.registry.get_parser_for_file(extension)
         if not parser:
@@ -59,51 +71,76 @@ class ASTChunker:
         chunks: list[CodeChunk] = []
         source_lines = source_code.splitlines(keepends=True)
 
-        # 1. Check for module docstring
+        # 1. Module Docstring Check
         docstring_chunk, first_stmt_idx = self._extract_module_docstring(
             root, source_lines, file_path
         )
         if docstring_chunk:
             chunks.append(docstring_chunk)
 
-        # 2. Iterate through top-level statements
+        # 2. Iterate Statements
         pending_block_nodes: list[tree_sitter.Node] = []
-
         children = root.children
+
         for i in range(first_stmt_idx, len(children)):
             child = children[i]
 
-            if child.type in ("comment",):
+            if child.type == "comment":
                 pending_block_nodes.append(child)
                 continue
 
-            if child.type in ("function_definition", "decorated_definition", "class_definition"):
-                # Flush pending module-level statements before processing definition
+            target_node = child
+            if child.type == "decorated_definition":
+                target_node = self._unwrap_decorated(child)
+
+            if target_node.type in ("function_definition", "class_definition"):
                 if pending_block_nodes:
                     block_chunk = self._create_block_chunk(pending_block_nodes, source_lines, file_path)
                     if block_chunk:
                         chunks.append(block_chunk)
                     pending_block_nodes = []
 
-                if child.type == "class_definition":
-                    chunks.extend(self._process_class_definition(child, source_lines, file_path))
+                if target_node.type == "class_definition":
+                    chunks.extend(
+                        self._process_class_definition(
+                            outer_node=child,
+                            inner_class_node=target_node,
+                            source_lines=source_lines,
+                            file_path=file_path,
+                        )
+                    )
                 else:
-                    chunks.extend(self._process_function_definition(child, source_lines, file_path))
+                    chunks.extend(
+                        self._process_function_definition(
+                            outer_node=child,
+                            inner_func_node=target_node,
+                            source_lines=source_lines,
+                            file_path=file_path,
+                        )
+                    )
             else:
                 pending_block_nodes.append(child)
 
-        # Flush any remaining statements (plain scripts, imports, globals, etc.)
+        # Flush residual top-level statements
         if pending_block_nodes:
             block_chunk = self._create_block_chunk(pending_block_nodes, source_lines, file_path)
             if block_chunk:
                 chunks.append(block_chunk)
 
-        # 3. Apply windowing / size threshold split if exceeded
+        # 3. Apply Threshold Enforcement
         enforced_chunks: list[CodeChunk] = []
         for chunk in chunks:
             enforced_chunks.extend(self._enforce_limits(chunk))
 
         return enforced_chunks
+
+    @staticmethod
+    def _unwrap_decorated(node: tree_sitter.Node) -> tree_sitter.Node:
+        """Finds inner class_definition or function_definition inside decorated_definition."""
+        for child in node.children:
+            if child.type in ("class_definition", "function_definition"):
+                return child
+        return node
 
     def _extract_module_docstring(
         self,
@@ -111,19 +148,14 @@ class ASTChunker:
         source_lines: list[str],
         file_path: Path,
     ) -> tuple[CodeChunk | None, int]:
-        """
-        Extracts top-level module docstrings if present as the first statement.
-        """
         children = root.children
         for idx, child in enumerate(children):
             if child.type == "comment":
                 continue
             if child.type == "expression_statement":
-                # Look for string child inside expression_statement
                 for sub in child.children:
                     if sub.type == "string":
-                        start_line = child.start_point.row + 1
-                        end_line = child.end_point.row + 1
+                        start_line, end_line = get_node_span(child)
                         content = "".join(source_lines[start_line - 1 : end_line]).strip()
                         return (
                             CodeChunk(
@@ -142,58 +174,93 @@ class ASTChunker:
 
     def _process_class_definition(
         self,
-        node: tree_sitter.Node,
+        outer_node: tree_sitter.Node,
+        inner_class_node: tree_sitter.Node,
         source_lines: list[str],
         file_path: Path,
         parent_scope: str | None = None,
     ) -> list[CodeChunk]:
-        """
-        Emits a CLASS chunk for the class declaration and individual METHOD chunks.
-        """
         results: list[CodeChunk] = []
-        class_name_node = node.child_by_field_name("name")
-        class_name = class_name_node.text.decode("utf-8") if class_name_node and class_name_node.text else "AnonymousClass"
+
+        # Extract name directly from inner class_definition
+        name_node = inner_class_node.child_by_field_name("name")
+        class_name = name_node.text.decode("utf-8") if name_node and name_node.text else "AnonymousClass"
         full_class_name = f"{parent_scope}.{class_name}" if parent_scope else class_name
 
-        body_node = node.child_by_field_name("body")
-        methods_and_subclasses: list[tree_sitter.Node] = []
+        body_node = inner_class_node.child_by_field_name("body")
+        methods_and_subclasses: list[tuple[tree_sitter.Node, tree_sitter.Node]] = []
+
+        skeleton_lines: list[str] = []
+        outer_start_line, outer_end_line = get_node_span(outer_node)
 
         if body_node:
-            for child in body_node.children:
-                if child.type in ("function_definition", "decorated_definition", "class_definition"):
-                    methods_and_subclasses.append(child)
+            body_start_line, _ = get_node_span(body_node)
+            # Add class signature lines and decorators
+            skeleton_lines.extend(source_lines[outer_start_line - 1 : body_start_line - 1])
 
-        # 1. Create chunk for class itself
-        class_start_line = node.start_point.row + 1
-        class_end_line = node.end_point.row + 1
-        class_content = "".join(source_lines[class_start_line - 1 : class_end_line]).rstrip()
+            for member in body_node.children:
+                if member.type == "comment":
+                    m_start, m_end = get_node_span(member)
+                    skeleton_lines.extend(source_lines[m_start - 1 : m_end])
+                    continue
 
+                target_member = member
+                if member.type == "decorated_definition":
+                    target_member = self._unwrap_decorated(member)
+
+                if target_member.type in ("function_definition", "class_definition"):
+                    methods_and_subclasses.append((member, target_member))
+                    # Retain signature outline in skeleton
+                    m_start, _ = get_node_span(member)
+                    func_body = target_member.child_by_field_name("body")
+                    if func_body:
+                        fb_start, _ = get_node_span(func_body)
+                        # Append up to the start of the body block + stub
+                        sig = "".join(source_lines[m_start - 1 : fb_start - 1]).rstrip()
+                        indent = " " * 8
+                        skeleton_lines.append(f"{sig}\n{indent}...\n")
+                    else:
+                        m_end = get_node_span(member)[1]
+                        skeleton_lines.extend(source_lines[m_start - 1 : m_end])
+                else:
+                    # Capture class attributes, docstrings, type annotations
+                    m_start, m_end = get_node_span(member)
+                    skeleton_lines.extend(source_lines[m_start - 1 : m_end])
+        else:
+            skeleton_lines.extend(source_lines[outer_start_line - 1 : outer_end_line])
+
+        # 1. Emit Class Skeleton
         results.append(
             CodeChunk(
                 file_path=file_path,
                 chunk_type=ChunkType.CLASS,
                 identifier=full_class_name,
                 parent_scope=parent_scope,
-                start_line=class_start_line,
-                end_line=class_end_line,
-                content=class_content,
+                start_line=outer_start_line,
+                end_line=outer_end_line,
+                content="".join(skeleton_lines).rstrip(),
             )
         )
 
-        # 2. Extract methods and nested classes
-        for member in methods_and_subclasses:
-            if member.type == "class_definition":
+        # 2. Extract Methods & Subclasses
+        for outer_member, inner_member in methods_and_subclasses:
+            if inner_member.type == "class_definition":
                 results.extend(
                     self._process_class_definition(
-                        member, source_lines, file_path, parent_scope=full_class_name
+                        outer_node=outer_member,
+                        inner_class_node=inner_member,
+                        source_lines=source_lines,
+                        file_path=file_path,
+                        parent_scope=full_class_name,
                     )
                 )
             else:
                 results.extend(
                     self._process_function_definition(
-                        member,
-                        source_lines,
-                        file_path,
+                        outer_node=outer_member,
+                        inner_func_node=inner_member,
+                        source_lines=source_lines,
+                        file_path=file_path,
                         parent_scope=full_class_name,
                         is_method=True,
                     )
@@ -203,34 +270,17 @@ class ASTChunker:
 
     def _process_function_definition(
         self,
-        node: tree_sitter.Node,
+        outer_node: tree_sitter.Node,
+        inner_func_node: tree_sitter.Node,
         source_lines: list[str],
         file_path: Path,
         parent_scope: str | None = None,
         is_method: bool = False,
     ) -> list[CodeChunk]:
-        """
-        Processes regular and decorated function definitions.
-        Decorators remain part of the function chunk.
-        """
-        func_node = node
-        if node.type == "decorated_definition":
-            # Find the inner function_definition or class_definition
-            for child in node.children:
-                if child.type == "function_definition":
-                    func_node = child
-                    break
-                if child.type == "class_definition":
-                    return self._process_class_definition(
-                        node, source_lines, file_path, parent_scope=parent_scope
-                    )
-
-        name_node = func_node.child_by_field_name("name")
+        name_node = inner_func_node.child_by_field_name("name")
         ident = name_node.text.decode("utf-8") if name_node and name_node.text else "anonymous"
 
-        # The chunk encompasses the entire definition node (including decorators)
-        start_line = node.start_point.row + 1
-        end_line = node.end_point.row + 1
+        start_line, end_line = get_node_span(outer_node)
         content = "".join(source_lines[start_line - 1 : end_line]).rstrip()
 
         return [
@@ -251,14 +301,11 @@ class ASTChunker:
         source_lines: list[str],
         file_path: Path,
     ) -> CodeChunk | None:
-        """
-        Creates a single BLOCK chunk grouping consecutive statements.
-        """
         if not nodes:
             return None
 
-        start_line = nodes[0].start_point.row + 1
-        end_line = nodes[-1].end_point.row + 1
+        start_line, _ = get_node_span(nodes[0])
+        _, end_line = get_node_span(nodes[-1])
         content = "".join(source_lines[start_line - 1 : end_line]).strip()
 
         if not content:
@@ -275,21 +322,13 @@ class ASTChunker:
         )
 
     def _enforce_limits(self, chunk: CodeChunk) -> list[CodeChunk]:
-        """
-        Enforces max_lines or max_chars threshold.
-        If chunk exceeds threshold, splits it into contiguous sub-window BLOCK chunks.
-        """
         if chunk.line_count <= self.max_lines and len(chunk.content) <= self.max_chars:
             return [chunk]
 
         logger.info(
-            "Chunk %s [%s] exceeds limits (lines=%d/%d, chars=%d/%d). Applying line windowing.",
+            "Chunk %s [%s] exceeds limits. Applying windowing.",
             chunk.identifier or "<block>",
             chunk.chunk_type.value,
-            chunk.line_count,
-            self.max_lines,
-            len(chunk.content),
-            self.max_chars,
         )
 
         lines = chunk.content.splitlines(keepends=True)
